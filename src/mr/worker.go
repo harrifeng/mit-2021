@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,7 +30,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -33,6 +38,109 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
+	for {
+		hargs := HandlerArgs{}
+		hreply := HandlerReply{}
+
+		call("Coordinator.Handler", &hargs, &hreply)
+		//log.Println("hreply", hreply)
+		if hreply.JobType == "map" {
+
+			file, err := os.Open(hreply.MapFile)
+			if err != nil {
+				log.Fatalf("cannot open %v", hreply.MapFile)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", hreply.MapFile)
+			}
+			file.Close()
+			kva := mapf(hreply.MapFile, string(content))
+
+			total := []*json.Encoder{}
+
+			for i := 0; i < hreply.ReduceNum; i++ {
+				tmp, err := os.Create(fmt.Sprintf("mr-%v-%v.json", hreply.MapIndex, i))
+				defer tmp.Close()
+				if err != nil {
+					panic(err)
+				}
+				enc := json.NewEncoder(tmp)
+				total = append(total, enc)
+			}
+
+			for _, onekva := range kva {
+				curr := total[ihash(onekva.Key)%10]
+				curr.Encode(&onekva)
+			}
+			log.Printf("map job mr-%v finished", hreply.MapIndex)
+
+			nargs := NotifyArgs{}
+			nreply := NotifyReply{}
+			nargs.NotifyType = "map"
+			nargs.NotifyIndex = hreply.MapIndex
+
+			call("Coordinator.Notify", &nargs, &nreply)
+
+		} else if hreply.JobType == "reduce" {
+
+			kva := []KeyValue{}
+			for i := 0; i < hreply.MapNum; i++ {
+				tmp, err := os.Open(fmt.Sprintf("mr-%v-%v.json", i, hreply.ReduceIndex))
+				defer tmp.Close()
+				if err != nil {
+					panic(err)
+				}
+
+				dec := json.NewDecoder(tmp)
+
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
+				}
+			}
+			sort.Sort(ByKey(kva))
+			oname := fmt.Sprintf("mr-out-%v", hreply.ReduceIndex)
+			ofile, _ := os.Create(oname)
+
+			i := 0
+			for i < len(kva) {
+				j := i + 1
+				for j < len(kva) && kva[j].Key == kva[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kva[k].Value)
+				}
+				output := reducef(kva[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+				i = j
+			}
+			log.Printf("reduce job mr-%v finished", hreply.ReduceIndex)
+
+			nargs := NotifyArgs{}
+			nreply := NotifyReply{}
+			nargs.NotifyType = "reduce"
+			nargs.NotifyIndex = hreply.ReduceIndex
+
+			call("Coordinator.Notify", &nargs, &nreply)
+
+		} else if hreply.JobType == " retry" {
+			//log.Println("retry--------------")
+		} else if hreply.JobType == "alldone" {
+			os.Exit(0)
+		} else {
+			//log.Println("sleeping 1 second")
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
@@ -83,3 +191,11 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	fmt.Println(err)
 	return false
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
